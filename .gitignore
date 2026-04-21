@@ -1,0 +1,23 @@
+# 虛擬環境
+.venv/
+venv/
+env/
+
+# Python 編譯快取
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS 系統檔
+.DS_Store
+.AppleDouble
+
+# AI assistant
+.idea/
+.vscode/
+*.swp
+
+# 下載暫存
+*.part
+*.ytdl
