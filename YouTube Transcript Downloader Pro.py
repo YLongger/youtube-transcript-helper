@@ -28,6 +28,8 @@ from typing import Callable, Optional
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
 
+import whisper_core as wc
+
 # ══════════════════════════════════════════════════════════
 # 設計常數
 # ══════════════════════════════════════════════════════════
@@ -150,6 +152,7 @@ class Environment:
     yt_dlp: Optional[str] = None
     ffmpeg: Optional[str] = None
     ffprobe: Optional[str] = None
+    whisper: Optional[str] = None
 
     @classmethod
     def detect(cls) -> "Environment":
@@ -176,6 +179,7 @@ class Environment:
             yt_dlp=find("yt-dlp"),
             ffmpeg=find("ffmpeg"),
             ffprobe=find("ffprobe"),
+            whisper=wc.find_whisper_bin(),
         )
 
     @property
@@ -185,6 +189,10 @@ class Environment:
     @property
     def ready_transcript(self) -> bool:
         return True  # youtube_transcript_api 是 Python 套件，此處必然存在
+
+    @property
+    def ready_whisper(self) -> bool:
+        return bool(self.whisper and self.yt_dlp and self.ffmpeg)
 
     def subprocess_env(self) -> dict:
         """合併系統 PATH 與 ffmpeg 所在目錄，避免子程序找不到 ffmpeg。"""
@@ -613,6 +621,7 @@ class App:
         self.root = root
         self.env = Environment.detect()
         self.current_task: Optional[DownloadTask] = None
+        self.current_whisper_task: Optional[wc.WhisperTask] = None
         self.current_info: VideoInfo = VideoInfo()
 
         self.root.title("YouTube 字幕小幫手")
@@ -635,6 +644,7 @@ class App:
         self._build_info_row(outer)
         self._build_options_row(outer)
         self._build_video_row(outer)
+        self._build_whisper_row(outer)
         self._build_action_row(outer)
         self._build_progress_row(outer)
         self._build_preview(outer)
@@ -725,7 +735,17 @@ class App:
             env_frame, text="ffmpeg", bg=COLORS["bg"],
             fg=COLORS["text_muted"], font=FONTS["tiny"],
         )
-        self.env_label_ffmpeg.pack(side=tk.LEFT, padx=(2, 0))
+        self.env_label_ffmpeg.pack(side=tk.LEFT, padx=(2, 10))
+        self.env_dot_whisper = tk.Label(
+            env_frame, text="●", bg=COLORS["bg"],
+            fg=COLORS["text_muted"], font=FONTS["body"],
+        )
+        self.env_dot_whisper.pack(side=tk.LEFT)
+        self.env_label_whisper = tk.Label(
+            env_frame, text="whisper", bg=COLORS["bg"],
+            fg=COLORS["text_muted"], font=FONTS["tiny"],
+        )
+        self.env_label_whisper.pack(side=tk.LEFT, padx=(2, 0))
 
     def _build_url_row(self, parent: tk.Frame) -> None:
         card = self._card(parent)
@@ -869,6 +889,50 @@ class App:
         self.cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.cancel_btn.pack_forget()
 
+    def _build_whisper_row(self, parent: tk.Frame) -> None:
+        card = self._card(parent)
+        row = tk.Frame(card, bg=COLORS["surface"])
+        row.pack(fill=tk.X)
+
+        tk.Label(
+            row, text="🎙  Whisper 語音轉錄", bg=COLORS["surface"],
+            fg=COLORS["text_secondary"], font=FONTS["small"],
+        ).pack(side=tk.LEFT)
+
+        # 模型選擇（以實際已下載者為預設）
+        default_model = wc.resolve_available_model() or "large-v3"
+        self.whisper_model_var = tk.StringVar(value=default_model)
+        combo = ttk.Combobox(
+            row, textvariable=self.whisper_model_var,
+            values=list(wc.WHISPER_MODELS.keys()),
+            state="readonly", width=10,
+        )
+        combo.pack(side=tk.LEFT, padx=(10, 8))
+
+        # 語言選擇
+        self.whisper_lang_var = tk.StringVar(value="繁體中文")
+        lang_combo = ttk.Combobox(
+            row, textvariable=self.whisper_lang_var,
+            values=list(wc.WHISPER_LANG_MAP.keys()),
+            state="readonly", width=10,
+        )
+        lang_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        # VAD 開關
+        self.whisper_vad_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            row, text="VAD 降噪",
+            variable=self.whisper_vad_var,
+            style="Check.TCheckbutton",
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        self.whisper_btn = HoverButton(
+            row, COLORS["accent"], COLORS["accent_hover"],
+            text="🎙 開始轉錄", fg="white", font=FONTS["btn"],
+            command=self.transcribe_with_whisper, padx=18, pady=6,
+        )
+        self.whisper_btn.pack(side=tk.LEFT)
+
     def _build_action_row(self, parent: tk.Frame) -> None:
         row = tk.Frame(parent, bg=COLORS["bg"])
         row.pack(fill=tk.X, pady=(0, 10))
@@ -961,11 +1025,15 @@ class App:
     def _update_env_indicator(self) -> None:
         ok_color = COLORS["success"]
         bad_color = COLORS["error"]
+        muted = COLORS["text_muted"]
 
         self.env_dot_ytdlp.config(fg=ok_color if self.env.yt_dlp else bad_color)
         self.env_label_ytdlp.config(fg=COLORS["text_secondary"] if self.env.yt_dlp else bad_color)
         self.env_dot_ffmpeg.config(fg=ok_color if self.env.ffmpeg else bad_color)
         self.env_label_ffmpeg.config(fg=COLORS["text_secondary"] if self.env.ffmpeg else bad_color)
+        # whisper 是可選項目，未安裝顯示灰色（非錯誤）
+        self.env_dot_whisper.config(fg=ok_color if self.env.whisper else muted)
+        self.env_label_whisper.config(fg=COLORS["text_secondary"] if self.env.whisper else muted)
 
         if not self.env.yt_dlp:
             self.toast.show("找不到 yt-dlp，請執行：pip install yt-dlp", "error")
@@ -1129,6 +1197,147 @@ class App:
         if self.current_task:
             self.current_task.cancel()
             self._set_idle("取消中…", COLORS["warning"])
+        if self.current_whisper_task:
+            self.current_whisper_task.cancel()
+            self._set_idle("取消中…", COLORS["warning"])
+
+    # ── 業務邏輯：Whisper 語音轉錄 ─────────────────────────
+    def transcribe_with_whisper(self) -> None:
+        url = self.url_entry.get().strip()
+        vid = self._require_vid(url)
+        if not vid:
+            return
+        if not self.env.yt_dlp:
+            self.toast.show("找不到 yt-dlp，請安裝：pip install yt-dlp", "error")
+            return
+        if not self.env.ffmpeg:
+            self.toast.show("找不到 ffmpeg，請安裝：brew install ffmpeg", "error")
+            return
+        if not self.env.whisper:
+            self.toast.show(
+                "找不到 whisper-cli，請安裝：brew install whisper-cpp",
+                "error",
+            )
+            return
+
+        model_key = self.whisper_model_var.get()
+        m_path = wc.model_path(model_key)
+        if not m_path.exists():
+            size_mb = wc.WHISPER_MODELS[model_key]["size_mb"]
+            self.toast.show(
+                f"模型 {model_key}（{size_mb}MB）尚未下載，將背景下載",
+                "warning",
+            )
+            self._download_whisper_model(model_key, then_transcribe=True)
+            return
+
+        self._start_whisper_task(url, model_key)
+
+    def _download_whisper_model(self, model_key: str, then_transcribe: bool) -> None:
+        meta = wc.WHISPER_MODELS[model_key]
+        dst = wc.model_path(model_key)
+
+        self._set_progress(0, f"下載模型 {model_key}…")
+        self._disable_buttons()
+
+        def worker():
+            try:
+                def on_p(pct: float):
+                    self.root.after(
+                        0, self._set_progress, pct, f"下載模型 {model_key} {pct:.1f}%",
+                    )
+                wc.download_model(meta["url"], dst, on_progress=on_p)
+                self.root.after(
+                    0, self.toast.show, f"模型 {model_key} 下載完成", "success",
+                )
+                self.root.after(0, self._set_idle, "模型下載完成", COLORS["success"])
+                self.root.after(0, self._enable_buttons)
+                if then_transcribe:
+                    self.root.after(200, self._start_whisper_task,
+                                    self.url_entry.get().strip(), model_key)
+            except Exception as e:
+                self.root.after(0, self.toast.show, f"模型下載失敗：{e}", "error")
+                self.root.after(0, self._set_idle, "模型下載失敗", COLORS["error"])
+                self.root.after(0, self._enable_buttons)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_whisper_task(self, url: str, model_key: str) -> None:
+        if not url:
+            return
+        lang_label = self.whisper_lang_var.get()
+        lang = wc.WHISPER_LANG_MAP.get(lang_label, "auto")
+        prompt = wc.WHISPER_DEFAULT_PROMPT_ZH if lang == "zh" else None
+
+        vad_file = wc.vad_path() if self.whisper_vad_var.get() else None
+        if vad_file and not vad_file.exists():
+            # VAD 模型很小（1MB），自動下載
+            try:
+                vad_file.parent.mkdir(parents=True, exist_ok=True)
+                wc.download_model(wc.WHISPER_VAD["url"], vad_file)
+            except Exception as e:
+                self.toast.show(f"VAD 模型下載失敗，改用無 VAD 模式：{e}", "warning")
+                vad_file = None
+
+        workdir = Path.home() / ".whisper_tmp" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        assert self.env.whisper and self.env.yt_dlp and self.env.ffmpeg
+        task = wc.WhisperTask(
+            whisper_bin=self.env.whisper,
+            ytdlp_bin=self.env.yt_dlp,
+            ffmpeg_bin=self.env.ffmpeg,
+            model_file=str(wc.model_path(model_key)),
+            url=url,
+            workdir=workdir,
+            on_progress=self._on_whisper_progress,
+            on_done=self._on_whisper_done,
+            language=lang,
+            vad_model=str(vad_file) if vad_file else None,
+            prompt=prompt,
+            env=self.env.subprocess_env(),
+        )
+        self.current_whisper_task = task
+        self._toggle_cancel(True)
+        self._disable_buttons()
+        self._set_progress(0, f"Whisper 轉錄中（{model_key}）…")
+        task.start()
+
+    def _on_whisper_progress(self, state: wc.WhisperProgress) -> None:
+        def apply():
+            self.progress.config(value=state.percent)
+            self.status_label.config(
+                text=state.message or state.phase, fg=COLORS["accent"],
+            )
+            # 即時預覽
+            if state.text_preview:
+                self.preview_text.delete("1.0", tk.END)
+                self.preview_text.insert("1.0", state.text_preview)
+                self.preview_text.see(tk.END)
+        self.root.after(0, apply)
+
+    def _on_whisper_done(
+        self, success: bool, message: str, text: Optional[str],
+    ) -> None:
+        def apply():
+            self._toggle_cancel(False)
+            self._enable_buttons()
+            self.current_whisper_task = None
+            if success and text:
+                self.preview_text.delete("1.0", tk.END)
+                self.preview_text.insert("1.0", text)
+                chars = len(text)
+                lines = text.count("\n") + 1
+                self.word_count_label.config(
+                    text=f"{lines} 行 · {chars:,} 字元（Whisper）",
+                )
+                self.progress.config(value=100)
+                self._set_idle(message, COLORS["success"])
+                self.toast.show("轉錄完成，可按「下載字幕」另存", "success")
+            else:
+                self.progress.config(value=0)
+                self._set_idle(message, COLORS["error"])
+                self.toast.show(message, "error")
+            self.meta_label.config(text="")
+        self.root.after(0, apply)
 
     def _on_download_progress(self, state: DownloadProgress) -> None:
         def apply():
@@ -1220,11 +1429,11 @@ class App:
             self.cancel_btn.pack_forget()
 
     def _disable_buttons(self) -> None:
-        for b in (self.preview_btn, self.download_btn, self.video_dl_btn):
+        for b in (self.preview_btn, self.download_btn, self.video_dl_btn, self.whisper_btn):
             b.config(state=tk.DISABLED)
 
     def _enable_buttons(self) -> None:
-        for b in (self.preview_btn, self.download_btn, self.video_dl_btn):
+        for b in (self.preview_btn, self.download_btn, self.video_dl_btn, self.whisper_btn):
             b.config(state=tk.NORMAL)
 
 

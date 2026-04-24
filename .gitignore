@@ -12,6 +12,12 @@ __pycache__/
 # macOS 系統檔
 .DS_Store
 .AppleDouble
+Icon?
+
+# 測試副產物
+.coverage
+.pytest_cache/
+htmlcov/
 
 # AI assistant
 .idea/
